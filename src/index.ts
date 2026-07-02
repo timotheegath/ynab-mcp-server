@@ -4,6 +4,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { randomUUID } from "node:crypto";
 import * as ynab from "ynab";
+import express from "express";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import rateLimit from "express-rate-limit";
+import { Command } from "commander";
 
 // Import all tools
 import * as ListBudgetsTool from "./tools/ListBudgetsTool.js";
@@ -128,12 +132,241 @@ server.registerTool(ListMonthsTool.name, {
   inputSchema: ListMonthsTool.inputSchema,
 }, async (input) => ListMonthsTool.execute(input, api));
 
+// Configuration parsing with validation
+function getConfig() {
+  // Parse and validate PORT
+  let port = parseInt(process.env.PORT || "3000");
+  if (isNaN(port) || port < 1 || port > 65535) {
+    console.warn(`Invalid PORT value: ${process.env.PORT}. Using default port 3000.`);
+    port = 3000;
+  }
+
+  // Parse TRANSPORT_MODE (command line takes precedence over environment variable)
+  const transportMode = process.env.TRANSPORT_MODE || "stdio";
+  if (!["stdio", "http", "both"].includes(transportMode)) {
+    console.warn(`Invalid TRANSPORT_MODE: ${transportMode}. Using default 'stdio'.`);
+  }
+
+  // Parse CORS origins
+  const corsOrigins = process.env.CORS_ORIGINS?.split(",").map(origin => origin.trim()).filter(origin => origin.length > 0) || [];
+
+  // Validate HTTP mode requirements
+  if ((transportMode === "http" || transportMode === "both") && !process.env.HTTP_AUTH_TOKEN) {
+    console.warn("WARNING: HTTP mode enabled but HTTP_AUTH_TOKEN not set. Running in development mode without authentication.");
+  }
+
+  return {
+    port: port,
+    httpAuthToken: process.env.HTTP_AUTH_TOKEN,
+    transportMode: transportMode as "stdio" | "http" | "both",
+    corsOrigins: corsOrigins
+  };
+}
+
+// Parse command line arguments
+function parseCommandLineArgs() {
+  const program = new Command();
+  
+  program
+    .name('ynab-mcp-server')
+    .description('YNAB MCP Server with stdio and HTTP transport support')
+    .version('0.1.2')
+    .option('--transport-mode <mode>', 'Transport mode: stdio, http, or both', process.env.TRANSPORT_MODE || 'stdio')
+    .option('--port <port>', 'HTTP server port', process.env.PORT || '3000')
+    .option('--http-auth-token <token>', 'HTTP authentication token', process.env.HTTP_AUTH_TOKEN)
+    .option('--cors-origins <origins>', 'Comma-separated list of allowed CORS origins', process.env.CORS_ORIGINS);
+
+  program.parse(process.argv);
+  
+  const options = program.opts();
+  
+  // Set environment variables from command line options (command line takes precedence)
+  if (options.transportMode) process.env.TRANSPORT_MODE = options.transportMode;
+  if (options.port) process.env.PORT = options.port;
+  if (options.httpAuthToken) process.env.HTTP_AUTH_TOKEN = options.httpAuthToken;
+  if (options.corsOrigins) process.env.CORS_ORIGINS = options.corsOrigins;
+}
+
+// Authentication middleware for HTTP
+function createAuthMiddleware(authToken: string | undefined) {
+  return async function authMiddleware(req: express.Request, res: express.Response, next: express.NextFunction) {
+    // Skip authentication if no token is configured (development mode)
+    if (!authToken) {
+      console.warn("HTTP_AUTH_TOKEN not set - running in development mode without authentication");
+      return next();
+    }
+
+    // Check for Authorization header
+    const authHeader = req.headers["authorization"];
+    if (!authHeader) {
+      res.status(401).json({ error: "Unauthorized - Missing Authorization header" });
+      return;
+    }
+
+    // Parse Bearer token
+    const match = authHeader.match(/^Bearer (.+)$/);
+    if (!match) {
+      res.status(400).json({ error: "Bad Request - Malformed Authorization header" });
+      return;
+    }
+
+    const token = match[1];
+
+    // Constant-time comparison to prevent timing attacks
+    if (token.length !== authToken.length) {
+      res.status(401).json({ error: "Unauthorized - Invalid API key" });
+      return;
+    }
+
+    let valid = true;
+    for (let i = 0; i < token.length; i++) {
+      if (token.charCodeAt(i) !== authToken.charCodeAt(i)) {
+        valid = false;
+        break;
+      }
+    }
+
+    if (!valid) {
+      res.status(401).json({ error: "Unauthorized - Invalid API key" });
+      return;
+    }
+
+    next();
+  };
+}
+
+// HTTP server setup
+async function setupHttpServer(config: ReturnType<typeof getConfig>) {
+  const app = express();
+  app.use(express.json());
+
+  // CORS middleware
+  if (config.corsOrigins.length > 0) {
+    app.use((req, res, next) => {
+      const origin = req.headers.origin;
+      if (origin && config.corsOrigins.includes(origin)) {
+        res.setHeader("Access-Control-Allow-Origin", origin);
+      }
+      res.setHeader("Access-Control-Allow-Methods", "POST, GET, DELETE, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, MCP-Session-Id");
+      res.setHeader("Access-Control-Max-Age", "86400");
+      
+      if (req.method === "OPTIONS") {
+        res.sendStatus(204);
+        return;
+      }
+      next();
+    });
+  }
+
+  // Rate limiting middleware - 100 requests per minute
+  const limiter = rateLimit({
+    windowMs: 60 * 1000, // 1 minute
+    max: 100, // limit each IP to 100 requests per windowMs
+    message: {
+      error: "Too many requests, please try again later.",
+      status: 429,
+      retryAfter: 60
+    },
+    headers: true, // send rate limit info in headers
+  });
+
+  app.use(limiter);
+
+  // Authentication middleware
+  app.use(createAuthMiddleware(config.httpAuthToken));
+
+  // Map to store transports by session ID for stateful mode
+  const transports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
+
+  // Handle POST requests for client-to-server communication
+  app.post('/mcp', async (req, res) => {
+    // Create a new stateless transport for each request
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined, // Stateless mode
+      allowedOrigins: config.corsOrigins,
+      enableDnsRebindingProtection: true,
+    });
+
+    // Connect to the MCP server
+    await server.connect(transport);
+
+    // Handle the request
+    await transport.handleRequest(req, res, req.body);
+  });
+
+  // Handle GET requests for server-to-client notifications via SSE
+  app.get('/mcp', async (req, res) => {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    if (!sessionId || !transports[sessionId]) {
+      res.status(400).send('Invalid or missing session ID');
+      return;
+    }
+    
+    const transport = transports[sessionId];
+    await transport.handleRequest(req, res);
+  });
+
+  // Handle DELETE requests for session termination
+  app.delete('/mcp', async (req, res) => {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    if (!sessionId || !transports[sessionId]) {
+      res.status(400).send('Invalid or missing session ID');
+      return;
+    }
+    
+    const transport = transports[sessionId];
+    await transport.handleRequest(req, res);
+  });
+
+  return app;
+}
+
 // Start the server
 async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  // Parse command line arguments first
+  parseCommandLineArgs();
+  
+  const config = getConfig();
+  
+  if (config.transportMode === "stdio" || config.transportMode === "both") {
+    const stdioTransport = new StdioServerTransport();
+    await server.connect(stdioTransport);
+    console.error("YNAB MCP server running on stdio");
+  }
 
-  console.error("YNAB MCP server running on stdio");
+  if (config.transportMode === "http" || config.transportMode === "both") {
+    // Validate HTTP configuration
+    if (!config.httpAuthToken) {
+      console.warn("WARNING: HTTP_AUTH_TOKEN not set - HTTP server will run without authentication!");
+    }
+
+    const app = await setupHttpServer(config);
+    const httpServer = app.listen(config.port, () => {
+      console.error(`YNAB MCP server running on HTTP port ${config.port}`);
+    });
+
+    // Store server reference for graceful shutdown
+    (server as any).httpServer = httpServer;
+  }
+
+  // Graceful shutdown handling
+  const shutdown = async () => {
+    console.error("\nShutting down gracefully...");
+    await server.close();
+    if ((server as any).httpServer) {
+      await new Promise<void>((resolve, reject) => {
+        (server as any).httpServer.close((err: any) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+    }
+    process.exit(0);
+  };
+
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 }
 
 main().catch(console.error);

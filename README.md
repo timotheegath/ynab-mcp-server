@@ -20,6 +20,10 @@ use with the YNAB api.
 Specify env variables:
 * YNAB_API_TOKEN (required)
 * YNAB_BUDGET_ID (optional)
+* PORT (optional, default: 3000) - HTTP server port
+* HTTP_AUTH_TOKEN (optional) - API key for HTTP authentication
+* TRANSPORT_MODE (optional, default: stdio) - `stdio`, `http`, or `both`
+* CORS_ORIGINS (optional) - Comma-separated list of allowed CORS origins
 
 ## Goal
 The goal of the project is to be able to interact with my YNAB budget via an AI conversation.
