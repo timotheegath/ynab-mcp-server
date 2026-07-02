@@ -2,8 +2,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { randomUUID } from "node:crypto";
 import * as ynab from "ynab";
 import express from "express";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import rateLimit from "express-rate-limit";
 import { Command } from "commander";
 // Import all tools
@@ -212,6 +214,22 @@ async function setupHttpServer(config) {
             }
             res.setHeader("Access-Control-Allow-Methods", "POST, GET, DELETE, OPTIONS");
             res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, MCP-Session-Id");
+            res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
+            res.setHeader("Access-Control-Max-Age", "86400");
+            if (req.method === "OPTIONS") {
+                res.sendStatus(204);
+                return;
+            }
+            next();
+        });
+    }
+    else {
+        // Simple wildcard CORS for local development
+        app.use((req, res, next) => {
+            res.setHeader("Access-Control-Allow-Origin", "*");
+            res.setHeader("Access-Control-Allow-Methods", "POST, GET, DELETE, OPTIONS");
+            res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, MCP-Session-Id");
+            res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
             res.setHeader("Access-Control-Max-Age", "86400");
             if (req.method === "OPTIONS") {
                 res.sendStatus(204);
@@ -234,40 +252,45 @@ async function setupHttpServer(config) {
     app.use(limiter);
     // Authentication middleware
     app.use(createAuthMiddleware(config.httpAuthToken));
-    // Map to store transports by session ID for stateful mode
+    // Simple transports map for session storage
+    // Stores active transport instances by session ID for session reuse
     const transports = {};
-    // Handle POST requests for client-to-server communication
-    app.post('/mcp', async (req, res) => {
-        // Create a new stateless transport for each request
-        const transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: undefined, // Stateless mode
-            allowedOrigins: config.corsOrigins,
-            enableDnsRebindingProtection: true,
-        });
-        // Connect to the MCP server
-        await server.connect(transport);
-        // Handle the request
-        await transport.handleRequest(req, res, req.body);
-    });
-    // Handle GET requests for server-to-client notifications via SSE
-    app.get('/mcp', async (req, res) => {
+    // Unified handler for all MCP methods
+    // Handles session initialization, reuse, and error cases
+    app.all('/mcp', async (req, res) => {
         const sessionId = req.headers['mcp-session-id'];
-        if (!sessionId || !transports[sessionId]) {
-            res.status(400).send('Invalid or missing session ID');
-            return;
+        // Basic session routing
+        if (req.method === 'POST' && isInitializeRequest(req.body)) {
+            // Initialize request - create new session
+            const transport = new StreamableHTTPServerTransport({
+                sessionIdGenerator: () => randomUUID(), // Generate unique session ID
+                allowedOrigins: config.corsOrigins,
+                enableDnsRebindingProtection: true,
+            });
+            // Connect to the MCP server
+            await server.connect(transport);
+            // Store transport for session reuse
+            const generatedSessionId = transport.sessionId;
+            if (generatedSessionId) {
+                transports[generatedSessionId] = transport;
+                res.setHeader('Mcp-Session-Id', generatedSessionId);
+            }
+            // Handle the request
+            await transport.handleRequest(req, res, req.body);
         }
-        const transport = transports[sessionId];
-        await transport.handleRequest(req, res);
-    });
-    // Handle DELETE requests for session termination
-    app.delete('/mcp', async (req, res) => {
-        const sessionId = req.headers['mcp-session-id'];
-        if (!sessionId || !transports[sessionId]) {
-            res.status(400).send('Invalid or missing session ID');
-            return;
+        else if (sessionId && transports[sessionId]) {
+            // Session-based request - reuse existing transport
+            const transport = transports[sessionId];
+            await transport.handleRequest(req, res, req.method === 'POST' ? req.body : undefined);
         }
-        const transport = transports[sessionId];
-        await transport.handleRequest(req, res);
+        else if (!sessionId) {
+            // Missing session ID
+            res.status(400).json({ error: 'Missing session ID - please initialize a session first' });
+        }
+        else {
+            // Invalid session ID
+            res.status(400).json({ error: 'Invalid session ID - session not found' });
+        }
     });
     return app;
 }

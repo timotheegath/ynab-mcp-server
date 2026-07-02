@@ -25,6 +25,17 @@ Specify env variables:
 * TRANSPORT_MODE (optional, default: stdio) - `stdio`, `http`, or `both`
 * CORS_ORIGINS (optional) - Comma-separated list of allowed CORS origins
 
+## Session Management
+
+The server now supports basic stateful sessions for HTTP transport:
+
+- **Session Initialization**: POST requests with initialize method create a new session
+- **Session Reuse**: Subsequent requests use the `Mcp-Session-Id` header for session continuity
+- **CORS Support**: The `Mcp-Session-Id` header is exposed for client access
+- **Simple Storage**: Sessions are stored in-memory for single-user use
+
+For local development without CORS configuration, wildcard CORS (`*`) is automatically enabled.
+
 ## Goal
 The goal of the project is to be able to interact with my YNAB budget via an AI conversation.
 There are a few primary workflows I want to enable:
