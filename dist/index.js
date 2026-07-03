@@ -164,27 +164,46 @@ function parseCommandLineArgs() {
 // Authentication middleware for HTTP
 function createAuthMiddleware(authToken) {
     return async function authMiddleware(req, res, next) {
+        const clientIp = req.ip || req.connection.remoteAddress;
+        const requestId = req.headers['x-request-id'] || 'unknown';
         // Skip authentication if no token is configured (development mode)
         if (!authToken) {
-            console.warn("HTTP_AUTH_TOKEN not set - running in development mode without authentication");
+            console.error(`[${requestId}] ⚠️  AUTH: Development mode - no HTTP_AUTH_TOKEN configured. IP: ${clientIp}, Path: ${req.path}`);
             return next();
         }
         // Check for Authorization header
         const authHeader = req.headers["authorization"];
         if (!authHeader) {
-            res.status(401).json({ error: "Unauthorized - Missing Authorization header" });
+            console.error(`[${requestId}] 🚫 AUTH: Missing Authorization header. IP: ${clientIp}, Path: ${req.path}, Method: ${req.method}`);
+            res.status(401).json({
+                error: "Unauthorized - Missing Authorization header",
+                requestId,
+                timestamp: new Date().toISOString()
+            });
             return;
         }
         // Parse Bearer token
         const match = authHeader.match(/^Bearer (.+)$/);
         if (!match) {
-            res.status(400).json({ error: "Bad Request - Malformed Authorization header" });
+            console.error(`[${requestId}] 🚫 AUTH: Malformed Authorization header. IP: ${clientIp}, Header: ${authHeader}`);
+            res.status(400).json({
+                error: "Bad Request - Malformed Authorization header",
+                requestId,
+                timestamp: new Date().toISOString()
+            });
             return;
         }
         const token = match[1];
+        // Log authentication attempt
+        console.error(`[${requestId}] 🔐 AUTH: Authentication attempt. IP: ${clientIp}, Path: ${req.path}`);
         // Constant-time comparison to prevent timing attacks
         if (token.length !== authToken.length) {
-            res.status(401).json({ error: "Unauthorized - Invalid API key" });
+            console.error(`[${requestId}] 🚫 AUTH: Invalid token length. IP: ${clientIp}, Expected: ${authToken.length}, Got: ${token.length}`);
+            res.status(401).json({
+                error: "Unauthorized - Invalid API key",
+                requestId,
+                timestamp: new Date().toISOString()
+            });
             return;
         }
         let valid = true;
@@ -195,28 +214,51 @@ function createAuthMiddleware(authToken) {
             }
         }
         if (!valid) {
-            res.status(401).json({ error: "Unauthorized - Invalid API key" });
+            console.error(`[${requestId}] 🚫 AUTH: Invalid API key. IP: ${clientIp}, Path: ${req.path}`);
+            res.status(401).json({
+                error: "Unauthorized - Invalid API key",
+                requestId,
+                timestamp: new Date().toISOString()
+            });
             return;
         }
+        console.error(`[${requestId}] ✅ AUTH: Authentication successful. IP: ${clientIp}, Path: ${req.path}`);
         next();
     };
 }
 // HTTP server setup
 async function setupHttpServer(config) {
     const app = express();
+    // Request ID middleware for correlation
+    app.use((req, res, next) => {
+        const requestId = req.headers['x-request-id'] || randomUUID();
+        req.requestId = requestId;
+        res.setHeader('X-Request-ID', requestId);
+        next();
+    });
     app.use(express.json());
     // CORS middleware
     if (config.corsOrigins.length > 0) {
         app.use((req, res, next) => {
             const origin = req.headers.origin;
+            const clientIp = req.ip || req.connection.remoteAddress;
+            const requestId = req.headers['x-request-id'] || 'unknown';
+            if (req.method === "OPTIONS") {
+                console.error(`[${requestId}] 🔄 CORS: Preflight request. Origin: ${origin || 'none'}, IP: ${clientIp}`);
+            }
             if (origin && config.corsOrigins.includes(origin)) {
                 res.setHeader("Access-Control-Allow-Origin", origin);
+            }
+            else if (origin) {
+                console.error(`[${requestId}] 🚫 CORS: Blocked request from disallowed origin. Origin: ${origin}, Allowed: ${config.corsOrigins.join(', ')}, IP: ${clientIp}, Path: ${req.path}`);
+                // Note: We still set headers but don't explicitly block - the browser will enforce CORS
             }
             res.setHeader("Access-Control-Allow-Methods", "POST, GET, DELETE, OPTIONS");
             res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, MCP-Session-Id");
             res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
             res.setHeader("Access-Control-Max-Age", "86400");
             if (req.method === "OPTIONS") {
+                console.error(`[${requestId}] ✅ CORS: Preflight approved. Origin: ${origin || 'none'}`);
                 res.sendStatus(204);
                 return;
             }
@@ -226,12 +268,19 @@ async function setupHttpServer(config) {
     else {
         // Simple wildcard CORS for local development
         app.use((req, res, next) => {
+            const origin = req.headers.origin;
+            const clientIp = req.ip || req.connection.remoteAddress;
+            const requestId = req.headers['x-request-id'] || 'unknown';
+            if (req.method === "OPTIONS") {
+                console.error(`[${requestId}] 🔄 CORS: Preflight request (dev mode - wildcard). Origin: ${origin || 'none'}, IP: ${clientIp}`);
+            }
             res.setHeader("Access-Control-Allow-Origin", "*");
             res.setHeader("Access-Control-Allow-Methods", "POST, GET, DELETE, OPTIONS");
             res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, MCP-Session-Id");
             res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
             res.setHeader("Access-Control-Max-Age", "86400");
             if (req.method === "OPTIONS") {
+                console.error(`[${requestId}] ✅ CORS: Preflight approved (dev mode). Origin: ${origin || 'none'}`);
                 res.sendStatus(204);
                 return;
             }
@@ -248,6 +297,18 @@ async function setupHttpServer(config) {
             retryAfter: 60
         },
         headers: true, // send rate limit info in headers
+        handler: (req, res) => {
+            const clientIp = req.ip || req.connection.remoteAddress;
+            const requestId = req.headers['x-request-id'] || 'unknown';
+            console.error(`[${requestId}] ⚠️  RATE_LIMIT: IP ${clientIp} exceeded rate limit (100 req/min). Path: ${req.path}, Method: ${req.method}`);
+            res.status(429).json({
+                error: "Too many requests, please try again later.",
+                status: 429,
+                retryAfter: 60,
+                requestId,
+                timestamp: new Date().toISOString()
+            });
+        }
     });
     app.use(limiter);
     // Authentication middleware
@@ -292,14 +353,25 @@ async function setupHttpServer(config) {
             }
             else if (!sessionId) {
                 // Missing session ID
-                console.error(`✗ Session error: Missing session ID`);
-                res.status(400).json({ error: 'Missing session ID - please initialize a session first' });
+                const clientIp = req.ip || req.connection.remoteAddress;
+                console.error(`[${requestId}] 🚫 SESSION: Missing session ID. IP: ${clientIp}, Path: ${req.path}, Method: ${req.method}`);
+                res.status(400).json({
+                    error: 'Missing session ID - please initialize a session first',
+                    requestId,
+                    timestamp: new Date().toISOString()
+                });
                 console.error(`← [${requestId}] 400`);
             }
             else {
                 // Invalid session ID
-                console.error(`✗ Session error: Invalid session ID - session not found`);
-                res.status(400).json({ error: 'Invalid session ID - session not found' });
+                const clientIp = req.ip || req.connection.remoteAddress;
+                console.error(`[${requestId}] 🚫 SESSION: Invalid session ID. IP: ${clientIp}, Session: ${sessionId}, Path: ${req.path}`);
+                res.status(400).json({
+                    error: 'Invalid session ID - session not found',
+                    requestId,
+                    timestamp: new Date().toISOString(),
+                    sessionId: sessionId
+                });
                 console.error(`← [${requestId}] 400`);
             }
         }
