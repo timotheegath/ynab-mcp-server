@@ -76,12 +76,14 @@ export class RedisSessionStorage {
     }
 }
 /**
- * File-based session storage implementation
- * Stores sessions as JSON files in a ./sessions directory
+ * Hybrid session storage implementation
+ * Uses file storage for session validation + in-memory cache for active transports
+ * Ideal for personal use with limited sessions
  */
-export class FileSessionStorage {
+export class HybridSessionStorage {
     sessionsDir;
     ttlSeconds;
+    transportCache = {};
     constructor(sessionsDir = './sessions', ttlSeconds = 86400) {
         this.sessionsDir = sessionsDir;
         this.ttlSeconds = ttlSeconds;
@@ -93,14 +95,16 @@ export class FileSessionStorage {
     }
     async setSession(sessionId, transport) {
         try {
+            // Store session metadata in file for persistence
             const sessionData = {
                 sessionId: transport.sessionId,
                 createdAt: new Date().toISOString(),
-                expiresAt: new Date(Date.now() + this.ttlSeconds * 1000).toISOString(),
-                transport: transport // Store the entire transport object
+                expiresAt: new Date(Date.now() + this.ttlSeconds * 1000).toISOString()
             };
             const filePath = path.join(this.sessionsDir, `${sessionId}.json`);
             await fs.writeFile(filePath, JSON.stringify(sessionData, null, 2));
+            // Cache transport in memory for active use
+            this.transportCache[sessionId] = transport;
         }
         catch (error) {
             console.error(`Failed to store session ${sessionId}:`, error);
@@ -117,7 +121,8 @@ export class FileSessionStorage {
                 await this.deleteSession(sessionId);
                 return null;
             }
-            return sessionData.transport;
+            // Return cached transport if available
+            return this.transportCache[sessionId] || null;
         }
         catch (error) {
             if (error.code === 'ENOENT') {
@@ -129,16 +134,18 @@ export class FileSessionStorage {
     }
     async deleteSession(sessionId) {
         try {
+            // Remove from file storage
             const filePath = path.join(this.sessionsDir, `${sessionId}.json`);
             await fs.unlink(filePath);
         }
         catch (error) {
-            if (error.code === 'ENOENT') {
-                return; // File doesn't exist, nothing to delete
+            if (error.code !== 'ENOENT') {
+                console.error(`Failed to delete session file ${sessionId}:`, error);
+                throw error;
             }
-            console.error(`Failed to delete session ${sessionId}:`, error);
-            throw error;
         }
+        // Remove from memory cache
+        delete this.transportCache[sessionId];
     }
     async hasSession(sessionId) {
         try {
@@ -168,11 +175,11 @@ export function createSessionStorage(config) {
         console.log('🔧 Using Redis for session storage');
         return new RedisSessionStorage(config.redisUrl, 'mcp_session:', config.sessionTtlSeconds);
     }
-    if (config.storageType === 'file' || config.fileStorageDir) {
-        console.log('📁 Using file-based session storage');
-        return new FileSessionStorage(config.fileStorageDir || './sessions', config.sessionTtlSeconds);
+    if (config.storageType === 'file' || config.storageType === 'hybrid' || config.fileStorageDir) {
+        console.log('🔄 Using hybrid session storage (file + memory)');
+        return new HybridSessionStorage(config.fileStorageDir || './sessions', config.sessionTtlSeconds);
     }
-    // Default to file storage for better persistence in personal use
-    console.log('📁 Using file-based session storage (default for personal use)');
-    return new FileSessionStorage('./sessions', config.sessionTtlSeconds);
+    // Default to hybrid storage for better persistence in personal use
+    console.log('🔄 Using hybrid session storage (file + memory) - default for personal use');
+    return new HybridSessionStorage('./sessions', config.sessionTtlSeconds);
 }
