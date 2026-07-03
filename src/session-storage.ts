@@ -1,5 +1,7 @@
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createClient, RedisClientType } from "redis";
+import { promises as fs } from "fs";
+import path from "path";
 
 /**
  * Session storage interface for MCP server
@@ -70,7 +72,7 @@ export class RedisSessionStorage implements SessionStorage {
     this.client = createClient({ url: redisUrl });
     this.prefix = prefix;
     this.ttlSeconds = ttlSeconds;
-    
+
     // Connect to Redis
     this.client.connect().catch(error => {
       console.error('Failed to connect to Redis:', error);
@@ -86,7 +88,7 @@ export class RedisSessionStorage implements SessionStorage {
       // Note: We store minimal data in Redis, the actual transport is cached in memory
       // This allows us to validate session existence while maintaining performance
     };
-    
+
     await this.client.set(`${this.prefix}${sessionId}`, JSON.stringify(sessionData), {
       EX: this.ttlSeconds // Set TTL for automatic expiration
     });
@@ -95,7 +97,7 @@ export class RedisSessionStorage implements SessionStorage {
   async getSession(sessionId: string): Promise<StreamableHTTPServerTransport | null> {
     const data = await this.client.get(`${this.prefix}${sessionId}`);
     if (!data) return null;
-    
+
     // Session exists in Redis, but we need to return the actual transport
     // In a real implementation, we would either:
     // 1. Cache transports in memory and return from cache
@@ -122,20 +124,116 @@ export class RedisSessionStorage implements SessionStorage {
 }
 
 /**
+ * File-based session storage implementation
+ * Stores sessions as JSON files in a ./sessions directory
+ */
+export class FileSessionStorage implements SessionStorage {
+  private readonly sessionsDir: string;
+  private readonly ttlSeconds: number;
+
+  constructor(sessionsDir: string = './sessions', ttlSeconds: number = 86400) {
+    this.sessionsDir = sessionsDir;
+    this.ttlSeconds = ttlSeconds;
+
+    // Create sessions directory if it doesn't exist
+    fs.mkdir(this.sessionsDir, { recursive: true }).catch(error => {
+      console.error('Failed to create sessions directory:', error);
+      throw error;
+    });
+  }
+
+  async setSession(sessionId: string, transport: StreamableHTTPServerTransport): Promise<void> {
+    try {
+      const sessionData = {
+        sessionId: transport.sessionId,
+        createdAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + this.ttlSeconds * 1000).toISOString(),
+        transport: transport // Store the entire transport object
+      };
+
+      const filePath = path.join(this.sessionsDir, `${sessionId}.json`);
+      await fs.writeFile(filePath, JSON.stringify(sessionData, null, 2));
+    } catch (error) {
+      console.error(`Failed to store session ${sessionId}:`, error);
+      throw error;
+    }
+  }
+
+  async getSession(sessionId: string): Promise<StreamableHTTPServerTransport | null> {
+    try {
+      const filePath = path.join(this.sessionsDir, `${sessionId}.json`);
+      const data = await fs.readFile(filePath, 'utf-8');
+      const sessionData = JSON.parse(data);
+
+      // Check if session has expired
+      if (new Date(sessionData.expiresAt) < new Date()) {
+        await this.deleteSession(sessionId);
+        return null;
+      }
+
+      return sessionData.transport;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return null; // Session file doesn't exist
+      }
+      console.error(`Failed to retrieve session ${sessionId}:`, error);
+      throw error;
+    }
+  }
+
+  async deleteSession(sessionId: string): Promise<void> {
+    try {
+      const filePath = path.join(this.sessionsDir, `${sessionId}.json`);
+      await fs.unlink(filePath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return; // File doesn't exist, nothing to delete
+      }
+      console.error(`Failed to delete session ${sessionId}:`, error);
+      throw error;
+    }
+  }
+
+  async hasSession(sessionId: string): Promise<boolean> {
+    try {
+      const filePath = path.join(this.sessionsDir, `${sessionId}.json`);
+      await fs.access(filePath);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return false; // File doesn't exist
+      }
+      console.error(`Failed to check session ${sessionId}:`, error);
+      throw error;
+    }
+  }
+}
+
+/**
  * Session storage factory function
  * Creates appropriate session storage based on configuration
  */
 export function createSessionStorage(config: {
   redisUrl?: string;
   sessionTtlSeconds?: number;
+  fileStorageDir?: string;
+  storageType?: 'memory' | 'file' | 'redis';
 }): SessionStorage {
-  // Check for Redis configuration
-  if (config.redisUrl) {
+  // Check storage type configuration
+  if (config.storageType === 'redis' || config.redisUrl) {
+    if (!config.redisUrl) {
+      throw new Error('Redis storage selected but REDIS_URL not configured');
+    }
     console.log('🔧 Using Redis for session storage');
     return new RedisSessionStorage(config.redisUrl, 'mcp_session:', config.sessionTtlSeconds);
   }
-  
-  // Fallback to memory storage
-  console.log('⚠️  Using in-memory session storage (sessions will not persist across restarts)');
-  return new MemorySessionStorage();
+
+  if (config.storageType === 'file' || config.fileStorageDir) {
+    console.log('📁 Using file-based session storage');
+    return new FileSessionStorage(config.fileStorageDir || './sessions', config.sessionTtlSeconds);
+  }
+
+  // Default to file storage for better persistence in personal use
+  console.log('📁 Using file-based session storage (default for personal use)');
+  return new FileSessionStorage('./sessions', config.sessionTtlSeconds);
 }

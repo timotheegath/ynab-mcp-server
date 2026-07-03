@@ -130,6 +130,8 @@ function getConfig() {
     const corsOrigins = process.env.CORS_ORIGINS?.split(",").map(origin => origin.trim()).filter(origin => origin.length > 0) || [];
     // Parse Redis configuration for session storage
     const redisUrl = process.env.REDIS_URL;
+    // Parse session storage type
+    const storageType = process.env.SESSION_STORAGE_TYPE || 'file';
     let sessionTtlSeconds = parseInt(process.env.SESSION_TTL_SECONDS || "86400"); // Default: 24 hours
     if (isNaN(sessionTtlSeconds) || sessionTtlSeconds < 60) {
         console.warn(`Invalid SESSION_TTL_SECONDS value: ${process.env.SESSION_TTL_SECONDS}. Using default 86400 seconds (24 hours).`);
@@ -145,7 +147,8 @@ function getConfig() {
         transportMode: transportMode,
         corsOrigins: corsOrigins,
         redisUrl: redisUrl,
-        sessionTtlSeconds: sessionTtlSeconds
+        sessionTtlSeconds: sessionTtlSeconds,
+        storageType: storageType
     };
 }
 // Parse command line arguments
@@ -160,7 +163,8 @@ function parseCommandLineArgs() {
         .option('--http-auth-token <token>', 'HTTP authentication token', process.env.HTTP_AUTH_TOKEN)
         .option('--cors-origins <origins>', 'Comma-separated list of allowed CORS origins', process.env.CORS_ORIGINS)
         .option('--redis-url <url>', 'Redis connection URL for session storage', process.env.REDIS_URL)
-        .option('--session-ttl-seconds <seconds>', 'Session time-to-live in seconds', process.env.SESSION_TTL_SECONDS || '86400');
+        .option('--session-ttl-seconds <seconds>', 'Session time-to-live in seconds', process.env.SESSION_TTL_SECONDS || '86400')
+        .option('--session-storage-type <type>', 'Session storage type: memory, file, or redis', process.env.SESSION_STORAGE_TYPE || 'file');
     program.parse(process.argv);
     const options = program.opts();
     // Set environment variables from command line options (command line takes precedence)
@@ -172,6 +176,8 @@ function parseCommandLineArgs() {
         process.env.HTTP_AUTH_TOKEN = options.httpAuthToken;
     if (options.corsOrigins)
         process.env.CORS_ORIGINS = options.corsOrigins;
+    if (options.sessionStorageType)
+        process.env.SESSION_STORAGE_TYPE = options.sessionStorageType;
 }
 // Authentication middleware for HTTP
 function createAuthMiddleware(authToken) {
@@ -241,6 +247,8 @@ function createAuthMiddleware(authToken) {
 // HTTP server setup
 async function setupHttpServer(config) {
     const app = express();
+    // Trust proxy headers when running behind reverse proxy (nginx, etc.)
+    app.set('trust proxy', true);
     // Request ID middleware for correlation
     app.use((req, res, next) => {
         const requestId = req.headers['x-request-id'] || randomUUID();
