@@ -379,7 +379,7 @@ async function setupHttpServer(config: ReturnType<typeof getConfig>) {
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(), // Generate unique session ID
           allowedOrigins: config.corsOrigins,
-          enableDnsRebindingProtection: true,
+          enableDnsRebindingProtection: false,
         });
         
         // Connect to the MCP server
