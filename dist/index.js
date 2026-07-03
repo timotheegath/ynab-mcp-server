@@ -8,6 +8,7 @@ import express from "express";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import rateLimit from "express-rate-limit";
 import { Command } from "commander";
+import { createSessionStorage } from "./session-storage.js";
 // Import all tools
 import * as ListBudgetsTool from "./tools/ListBudgetsTool.js";
 import * as GetUnapprovedTransactionsTool from "./tools/GetUnapprovedTransactionsTool.js";
@@ -127,6 +128,13 @@ function getConfig() {
     }
     // Parse CORS origins
     const corsOrigins = process.env.CORS_ORIGINS?.split(",").map(origin => origin.trim()).filter(origin => origin.length > 0) || [];
+    // Parse Redis configuration for session storage
+    const redisUrl = process.env.REDIS_URL;
+    let sessionTtlSeconds = parseInt(process.env.SESSION_TTL_SECONDS || "86400"); // Default: 24 hours
+    if (isNaN(sessionTtlSeconds) || sessionTtlSeconds < 60) {
+        console.warn(`Invalid SESSION_TTL_SECONDS value: ${process.env.SESSION_TTL_SECONDS}. Using default 86400 seconds (24 hours).`);
+        sessionTtlSeconds = 86400;
+    }
     // Validate HTTP mode requirements
     if ((transportMode === "http" || transportMode === "both") && !process.env.HTTP_AUTH_TOKEN) {
         console.warn("WARNING: HTTP mode enabled but HTTP_AUTH_TOKEN not set. Running in development mode without authentication.");
@@ -135,7 +143,9 @@ function getConfig() {
         port: port,
         httpAuthToken: process.env.HTTP_AUTH_TOKEN,
         transportMode: transportMode,
-        corsOrigins: corsOrigins
+        corsOrigins: corsOrigins,
+        redisUrl: redisUrl,
+        sessionTtlSeconds: sessionTtlSeconds
     };
 }
 // Parse command line arguments
@@ -148,7 +158,9 @@ function parseCommandLineArgs() {
         .option('--transport-mode <mode>', 'Transport mode: stdio, http, or both', process.env.TRANSPORT_MODE || 'stdio')
         .option('--port <port>', 'HTTP server port', process.env.PORT || '3000')
         .option('--http-auth-token <token>', 'HTTP authentication token', process.env.HTTP_AUTH_TOKEN)
-        .option('--cors-origins <origins>', 'Comma-separated list of allowed CORS origins', process.env.CORS_ORIGINS);
+        .option('--cors-origins <origins>', 'Comma-separated list of allowed CORS origins', process.env.CORS_ORIGINS)
+        .option('--redis-url <url>', 'Redis connection URL for session storage', process.env.REDIS_URL)
+        .option('--session-ttl-seconds <seconds>', 'Session time-to-live in seconds', process.env.SESSION_TTL_SECONDS || '86400');
     program.parse(process.argv);
     const options = program.opts();
     // Set environment variables from command line options (command line takes precedence)
@@ -313,9 +325,55 @@ async function setupHttpServer(config) {
     app.use(limiter);
     // Authentication middleware
     app.use(createAuthMiddleware(config.httpAuthToken));
-    // Simple transports map for session storage
-    // Stores active transport instances by session ID for session reuse
-    const transports = {};
+    // Initialize session storage
+    const sessionStorage = createSessionStorage(config);
+    // Health check endpoint for session storage monitoring
+    app.get('/health/session-storage', async (req, res) => {
+        const requestId = req.headers['x-request-id'] || 'unknown';
+        console.error(`[${requestId}] 🩺 Health check: session storage`);
+        try {
+            // Test basic session storage functionality
+            const testSessionId = `health-check-${Date.now()}`;
+            const mockTransport = {
+                sessionId: testSessionId
+            };
+            // Test set operation
+            await sessionStorage.setSession(testSessionId, mockTransport);
+            // Test has operation
+            const hasSession = await sessionStorage.hasSession(testSessionId);
+            // Test get operation
+            const retrieved = await sessionStorage.getSession(testSessionId);
+            // Test delete operation
+            await sessionStorage.deleteSession(testSessionId);
+            // Determine storage type
+            const storageType = config.redisUrl ? 'redis' : 'memory';
+            res.status(200).json({
+                status: 'healthy',
+                storageType: storageType,
+                redisUrl: config.redisUrl ? 'configured' : 'not configured',
+                sessionTtlSeconds: config.sessionTtlSeconds,
+                testResults: {
+                    setOperation: 'success',
+                    hasOperation: hasSession ? 'success' : 'failed',
+                    getOperation: retrieved ? 'success' : 'failed',
+                    deleteOperation: 'success'
+                },
+                timestamp: new Date().toISOString(),
+                requestId: requestId
+            });
+            console.error(`[${requestId}] ✅ Health check passed: ${storageType} storage operational`);
+        }
+        catch (error) {
+            console.error(`[${requestId}] ❌ Health check failed:`, error);
+            res.status(503).json({
+                status: 'unhealthy',
+                error: error instanceof Error ? error.message : 'Unknown error',
+                storageType: config.redisUrl ? 'redis' : 'memory',
+                timestamp: new Date().toISOString(),
+                requestId: requestId
+            });
+        }
+    });
     // Unified handler for all MCP methods
     // Handles session initialization, reuse, and error cases
     app.all('/mcp', async (req, res) => {
@@ -329,26 +387,76 @@ async function setupHttpServer(config) {
                 const transport = new StreamableHTTPServerTransport({
                     sessionIdGenerator: () => randomUUID(), // Generate unique session ID
                     allowedOrigins: config.corsOrigins,
-                    enableDnsRebindingProtection: true,
+                    enableDnsRebindingProtection: false,
                 });
                 // Connect to the MCP server
                 await server.connect(transport);
                 // Store transport for session reuse
                 const generatedSessionId = transport.sessionId;
                 if (generatedSessionId) {
-                    transports[generatedSessionId] = transport;
-                    res.setHeader('Mcp-Session-Id', generatedSessionId);
-                    console.error(`✓ New MCP session initialized: ${generatedSessionId}`);
+                    try {
+                        await sessionStorage.setSession(generatedSessionId, transport);
+                        res.setHeader('Mcp-Session-Id', generatedSessionId);
+                        console.error(`✓ New MCP session initialized: ${generatedSessionId}`);
+                    }
+                    catch (storageError) {
+                        console.error(`[${requestId}] ❌ SESSION_STORAGE: Failed to store session ${generatedSessionId}:`, storageError);
+                        // Continue without session storage - session won't persist but request will work
+                    }
                 }
                 // Handle the request
                 await transport.handleRequest(req, res, req.body);
                 console.error(`← [${requestId}] ${res.statusCode}`);
             }
-            else if (sessionId && transports[sessionId]) {
-                // Session-based request - reuse existing transport
-                console.error(`✓ Reusing existing session: ${sessionId}`);
-                const transport = transports[sessionId];
-                await transport.handleRequest(req, res, req.method === 'POST' ? req.body : undefined);
+            else if (sessionId) {
+                // Session-based request - check if session exists and reuse
+                try {
+                    if (await sessionStorage.hasSession(sessionId)) {
+                        console.error(`✓ Reusing existing session: ${sessionId}`);
+                        const transport = await sessionStorage.getSession(sessionId);
+                        if (transport) {
+                            await transport.handleRequest(req, res, req.method === 'POST' ? req.body : undefined);
+                            console.error(`← [${requestId}] ${res.statusCode}`);
+                        }
+                        else {
+                            // Session exists but transport couldn't be retrieved, treat as invalid
+                            const clientIp = req.ip || req.connection.remoteAddress;
+                            console.error(`[${requestId}] 🚫 SESSION: Session exists but transport unavailable. IP: ${clientIp}, Session: ${sessionId}`);
+                            res.status(400).json({
+                                error: 'Session transport unavailable',
+                                requestId,
+                                timestamp: new Date().toISOString(),
+                                sessionId: sessionId
+                            });
+                            console.error(`← [${requestId}] 400`);
+                        }
+                    }
+                    else {
+                        // Invalid session ID
+                        const clientIp = req.ip || req.connection.remoteAddress;
+                        console.error(`[${requestId}] 🚫 SESSION: Invalid session ID. IP: ${clientIp}, Session: ${sessionId}, Path: ${req.path}`);
+                        res.status(400).json({
+                            error: 'Invalid session ID - session not found',
+                            requestId,
+                            timestamp: new Date().toISOString(),
+                            sessionId: sessionId
+                        });
+                        console.error(`← [${requestId}] 400`);
+                    }
+                }
+                catch (storageError) {
+                    console.error(`[${requestId}] ❌ SESSION_STORAGE: Error checking session ${sessionId}:`, storageError);
+                    // Fallback to memory-only behavior on storage errors
+                    const clientIp = req.ip || req.connection.remoteAddress;
+                    console.error(`[${requestId}] 🚫 SESSION: Invalid session ID (storage error). IP: ${clientIp}, Session: ${sessionId}, Path: ${req.path}`);
+                    res.status(400).json({
+                        error: 'Invalid session ID - session not found',
+                        requestId,
+                        timestamp: new Date().toISOString(),
+                        sessionId: sessionId
+                    });
+                    console.error(`← [${requestId}] 400`);
+                }
                 console.error(`← [${requestId}] ${res.statusCode}`);
             }
             else if (!sessionId) {

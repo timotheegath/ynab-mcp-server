@@ -24,15 +24,76 @@ Specify env variables:
 * HTTP_AUTH_TOKEN (optional) - API key for HTTP authentication
 * TRANSPORT_MODE (optional, default: stdio) - `stdio`, `http`, or `both`
 * CORS_ORIGINS (optional) - Comma-separated list of allowed CORS origins
+* REDIS_URL (optional) - Redis connection URL for session storage (e.g., `redis://localhost:6379`)
+* SESSION_TTL_SECONDS (optional, default: 86400) - Session time-to-live in seconds (24 hours)
 
 ## Session Management
 
-The server now supports basic stateful sessions for HTTP transport:
+The server now supports persistent stateful sessions for HTTP transport with configurable storage backends:
+
+### Session Storage Options
+
+1. **Redis Storage (Recommended for Production)**
+   - Sessions persist across server restarts
+   - Supports horizontal scaling
+   - Requires Redis server
+   - Set `REDIS_URL` environment variable to enable
+
+2. **Memory Storage (Default)**
+   - Simple in-memory session storage
+   - Sessions are lost on server restart
+   - No additional dependencies required
+   - Automatic fallback when Redis is unavailable
+
+### Session Features
 
 - **Session Initialization**: POST requests with initialize method create a new session
 - **Session Reuse**: Subsequent requests use the `Mcp-Session-Id` header for session continuity
 - **CORS Support**: The `Mcp-Session-Id` header is exposed for client access
-- **Simple Storage**: Sessions are stored in-memory for single-user use
+- **Automatic Fallback**: Gracefully falls back to memory storage if Redis connection fails
+- **Configurable TTL**: Session expiration with `SESSION_TTL_SECONDS` environment variable
+
+### Configuration Examples
+
+**Memory Storage (Default):**
+```bash
+# No Redis configuration needed
+npm start
+```
+
+**Redis Storage:**
+```bash
+# With Redis
+REDIS_URL=redis://localhost:6379 npm start
+
+# With custom session TTL (1 hour)
+REDIS_URL=redis://localhost:6379 SESSION_TTL_SECONDS=3600 npm start
+```
+
+**Docker with Redis:**
+```bash
+docker run -d --name redis -p 6379:6379 redis
+REDIS_URL=redis://localhost:6379 npm start
+```
+
+### Testing Session Persistence
+
+You can test session persistence using curl commands:
+
+```bash
+# Create a new session
+curl -X POST http://localhost:3000/mcp \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your_ynab_api_token" \
+  -d '{"action": "initialize"}'
+
+# Reuse the session (replace SESSION_ID with actual session ID)
+curl -X POST http://localhost:3000/mcp \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your_ynab_api_token" \
+  -H "Mcp-Session-Id: SESSION_ID" \
+  -d '{"action": "list_accounts"}'
+```
 
 For local development without CORS configuration, wildcard CORS (`*`) is automatically enabled.
 

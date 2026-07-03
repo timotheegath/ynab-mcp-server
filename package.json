@@ -29,6 +29,7 @@
     "axios": "^1.8.4",
     "commander": "^14.0.1",
     "express-rate-limit": "^8.5.2",
+    "redis": "^4.6.0",
     "ynab": "^2.9.0",
     "zod": "^3.23.8"
   },

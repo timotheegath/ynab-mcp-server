@@ -1,0 +1,13 @@
+name: fix-session-storage
+title: Fix Session Storage Issue
+description: Implement persistent session storage to fix session ID validation failures
+author: OpenCode Agent
+created: 2026-07-03
+status: proposed
+schema: spec-driven
+
+apply:
+  requires:
+    - proposal
+    - design
+    - tasks
