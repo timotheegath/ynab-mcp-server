@@ -392,15 +392,16 @@ async function setupHttpServer(config) {
             // Basic session routing
             if (req.method === 'POST' && isInitializeRequest(req.body)) {
                 // Initialize request - create new session
+                const sessionId = randomUUID(); // Generate session ID explicitly
                 const transport = new StreamableHTTPServerTransport({
-                    sessionIdGenerator: () => randomUUID(), // Generate unique session ID
+                    sessionIdGenerator: () => sessionId, // Use the generated session ID
                     allowedOrigins: config.corsOrigins,
                     enableDnsRebindingProtection: false,
                 });
                 // Connect to the MCP server
                 await server.connect(transport);
                 // Store transport for session reuse
-                const generatedSessionId = transport.sessionId;
+                const generatedSessionId = sessionId;
                 if (generatedSessionId) {
                     try {
                         await sessionStorage.setSession(generatedSessionId, transport);

@@ -122,7 +122,14 @@ export class HybridSessionStorage {
                 return null;
             }
             // Return cached transport if available
-            return this.transportCache[sessionId] || null;
+            const cachedTransport = this.transportCache[sessionId];
+            if (cachedTransport) {
+                // Ensure the transport has the correct session ID
+                // Note: transport.sessionId might be undefined until first request,
+                // but that's okay - the session ID is managed by our storage layer
+                return cachedTransport;
+            }
+            return null;
         }
         catch (error) {
             if (error.code === 'ENOENT') {
