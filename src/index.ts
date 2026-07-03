@@ -300,38 +300,54 @@ async function setupHttpServer(config: ReturnType<typeof getConfig>) {
   // Handles session initialization, reuse, and error cases
   app.all('/mcp', async (req, res) => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    const requestId = randomUUID();
+    console.error(`→ [${requestId}] ${req.method} ${req.path} ${sessionId ? `session=${sessionId}` : 'new-session'}`);
     
-    // Basic session routing
-    if (req.method === 'POST' && isInitializeRequest(req.body)) {
-      // Initialize request - create new session
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => randomUUID(), // Generate unique session ID
-        allowedOrigins: config.corsOrigins,
-        enableDnsRebindingProtection: true,
-      });
-      
-      // Connect to the MCP server
-      await server.connect(transport);
-      
-      // Store transport for session reuse
-      const generatedSessionId = transport.sessionId;
-      if (generatedSessionId) {
-        transports[generatedSessionId] = transport;
-        res.setHeader('Mcp-Session-Id', generatedSessionId);
+    try {
+      // Basic session routing
+      if (req.method === 'POST' && isInitializeRequest(req.body)) {
+        // Initialize request - create new session
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(), // Generate unique session ID
+          allowedOrigins: config.corsOrigins,
+          enableDnsRebindingProtection: true,
+        });
+        
+        // Connect to the MCP server
+        await server.connect(transport);
+        
+        // Store transport for session reuse
+        const generatedSessionId = transport.sessionId;
+        if (generatedSessionId) {
+          transports[generatedSessionId] = transport;
+          res.setHeader('Mcp-Session-Id', generatedSessionId);
+          console.error(`✓ New MCP session initialized: ${generatedSessionId}`);
+        }
+        
+        // Handle the request
+        await transport.handleRequest(req, res, req.body);
+        console.error(`← [${requestId}] ${res.statusCode}`);
+      } else if (sessionId && transports[sessionId]) {
+        // Session-based request - reuse existing transport
+        console.error(`✓ Reusing existing session: ${sessionId}`);
+        const transport = transports[sessionId];
+        await transport.handleRequest(req, res, req.method === 'POST' ? req.body : undefined);
+        console.error(`← [${requestId}] ${res.statusCode}`);
+      } else if (!sessionId) {
+        // Missing session ID
+        console.error(`✗ Session error: Missing session ID`);
+        res.status(400).json({ error: 'Missing session ID - please initialize a session first' });
+        console.error(`← [${requestId}] 400`);
+      } else {
+        // Invalid session ID
+        console.error(`✗ Session error: Invalid session ID - session not found`);
+        res.status(400).json({ error: 'Invalid session ID - session not found' });
+        console.error(`← [${requestId}] 400`);
       }
-      
-      // Handle the request
-      await transport.handleRequest(req, res, req.body);
-    } else if (sessionId && transports[sessionId]) {
-      // Session-based request - reuse existing transport
-      const transport = transports[sessionId];
-      await transport.handleRequest(req, res, req.method === 'POST' ? req.body : undefined);
-    } else if (!sessionId) {
-      // Missing session ID
-      res.status(400).json({ error: 'Missing session ID - please initialize a session first' });
-    } else {
-      // Invalid session ID
-      res.status(400).json({ error: 'Invalid session ID - session not found' });
+    } catch (error) {
+      console.error(`✗ [${requestId}] Request failed:`, error);
+      res.status(500).json({ error: "Internal server error" });
+      console.error(`← [${requestId}] 500`);
     }
   });
 
@@ -344,11 +360,18 @@ async function main() {
   parseCommandLineArgs();
   
   const config = getConfig();
+  console.error(`Starting YNAB MCP server v0.1.2 in ${config.transportMode} mode`);
   
   if (config.transportMode === "stdio" || config.transportMode === "both") {
-    const stdioTransport = new StdioServerTransport();
-    await server.connect(stdioTransport);
-    console.error("YNAB MCP server running on stdio");
+    try {
+      const stdioTransport = new StdioServerTransport();
+      await server.connect(stdioTransport);
+      console.error("✓ Stdio transport initialized and connected");
+      console.error("YNAB MCP server running on stdio");
+    } catch (error) {
+      console.error("✗ Stdio transport initialization failed:", error);
+      process.exit(1);
+    }
   }
 
   if (config.transportMode === "http" || config.transportMode === "both") {
@@ -359,26 +382,50 @@ async function main() {
 
     const app = await setupHttpServer(config);
     const httpServer = app.listen(config.port, () => {
-      console.error(`YNAB MCP server running on HTTP port ${config.port}`);
+      console.error(`✓ HTTP server listening on port ${config.port}`);
+      console.error(`✓ Transport mode: ${config.transportMode}`);
+      console.error(`✓ Authentication: ${config.httpAuthToken ? 'enabled' : 'disabled (dev mode)'}`);
     });
 
     // Store server reference for graceful shutdown
     (server as any).httpServer = httpServer;
+
+    // Add error handler for HTTP server
+    httpServer.on('error', (error) => {
+      console.error("✗ HTTP server failed to start:", error);
+      process.exit(1);
+    });
   }
 
   // Graceful shutdown handling
   const shutdown = async () => {
-    console.error("\nShutting down gracefully...");
-    await server.close();
-    if ((server as any).httpServer) {
-      await new Promise<void>((resolve, reject) => {
-        (server as any).httpServer.close((err: any) => {
-          if (err) reject(err);
-          else resolve();
+    console.error("\n🛑 Shutdown signal received. Initiating graceful shutdown...");
+
+    try {
+      console.error("🔌 Closing MCP server connections...");
+      await server.close();
+      console.error("✓ MCP server connections closed");
+
+      if ((server as any).httpServer) {
+        console.error("🌐 Closing HTTP server...");
+        await new Promise<void>((resolve, reject) => {
+          (server as any).httpServer.close((err: any) => {
+            if (err) {
+              console.error("✗ HTTP server shutdown error:", err);
+              reject(err);
+            } else {
+              console.error("✓ HTTP server closed");
+              resolve();
+            }
+          });
         });
-      });
+      }
+      console.error("✓ Graceful shutdown completed");
+      process.exit(0);
+    } catch (error) {
+      console.error("✗ Shutdown failed:", error);
+      process.exit(1);
     }
-    process.exit(0);
   };
 
   process.on("SIGINT", shutdown);
